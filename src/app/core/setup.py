@@ -11,9 +11,13 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
+from fastapi_authz import CasbinMiddleware
+from starlette.middleware.authentication import AuthenticationMiddleware
 
 from ..api.dependencies import get_current_superuser
+from ..core.authz.casbin import enforcer, initialize_enforcer
 from ..core.utils.rate_limit import rate_limiter
+from ..middleware.authentication import JWTAuthenticationBackend
 from ..middleware.client_cache_middleware import ClientCacheMiddleware
 from ..models import *  # noqa: F403
 from .config import (
@@ -101,30 +105,32 @@ def lifespan_factory(
         await set_threadpool_tokens()
 
         try:
-            if isinstance(settings, RedisCacheSettings):
+            if isinstance(settings, RedisCacheSettings) and settings.REDIS_ENABLED:
                 await create_redis_cache_pool()
 
-            if isinstance(settings, RedisQueueSettings):
+            if isinstance(settings, RedisQueueSettings) and settings.REDIS_ENABLED:
                 await create_redis_queue_pool()
 
-            if isinstance(settings, RedisRateLimiterSettings):
+            if isinstance(settings, RedisRateLimiterSettings) and settings.REDIS_ENABLED:
                 await create_redis_rate_limit_pool()
 
             if create_tables_on_start:
                 await create_tables()
+
+            await initialize_enforcer()
 
             initialization_complete.set()
 
             yield
 
         finally:
-            if isinstance(settings, RedisCacheSettings):
+            if isinstance(settings, RedisCacheSettings) and settings.REDIS_ENABLED:
                 await close_redis_cache_pool()
 
-            if isinstance(settings, RedisQueueSettings):
+            if isinstance(settings, RedisQueueSettings) and settings.REDIS_ENABLED:
                 await close_redis_queue_pool()
 
-            if isinstance(settings, RedisRateLimiterSettings):
+            if isinstance(settings, RedisRateLimiterSettings) and settings.REDIS_ENABLED:
                 await close_redis_rate_limit_pool()
 
     return lifespan
@@ -208,6 +214,9 @@ def create_application(
     application = FastAPI(lifespan=lifespan, **kwargs)
     application.include_router(router)
 
+    application.add_middleware(CasbinMiddleware, enforcer=enforcer)
+    application.add_middleware(AuthenticationMiddleware, backend=JWTAuthenticationBackend())
+
     if isinstance(settings, ClientSideCacheSettings):
         application.add_middleware(ClientCacheMiddleware, max_age=settings.CLIENT_CACHE_MAX_AGE)
 
@@ -228,7 +237,12 @@ def create_application(
 
             @docs_router.get("/docs", include_in_schema=False)
             async def get_swagger_documentation() -> fastapi.responses.HTMLResponse:
-                return get_swagger_ui_html(openapi_url="/openapi.json", title="docs")
+                return get_swagger_ui_html(
+                    openapi_url="/openapi.json",
+                    title="docs",
+                    swagger_js_url="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.29.1/swagger-ui-bundle.min.js",
+                    swagger_css_url="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.29.1/swagger-ui.min.css",
+                )
 
             @docs_router.get("/redoc", include_in_schema=False)
             async def get_redoc_documentation() -> fastapi.responses.HTMLResponse:
